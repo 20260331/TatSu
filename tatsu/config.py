@@ -36,6 +36,11 @@ class ParserConfig(Config):
     memoize_lookaheads: bool | None = None
     prune_memos_on_cut: bool = True
 
+    # Per-parse integer resource budget.
+    # Caps rule calls, nested rule depth, and memo entries for one parse.
+    # None means unlimited.
+    budget: int | None = None
+
     colorize: bool = True
     trace: bool = False
     trace_filename: str = ''
@@ -84,6 +89,13 @@ class ParserConfig(Config):
             raise TypeError(
                 f'semantics must be an object instance or None, not class {self.semantics!r}',
             )
+
+        if self.budget is not None and (
+            isinstance(self.budget, bool)
+            or not isinstance(self.budget, int)
+            or self.budget <= 0
+        ):
+            raise ValueError('budget must be a positive integer or None')
 
         self._check_deprecations()
         self._compile_comments()

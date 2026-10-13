@@ -117,34 +117,37 @@ class ParserEngine(ParserCore, CanParse):
 
     def call(self, ri: RuleInfo) -> Any:
         self.heartbeat()
+        self._enter_rule_call(ri)
         if ri.should_trace:
             self.callstack.append(ri)
-        self.next_token(ri)
-        key = self.memokey()
-
-        pos = self.pos
         try:
-            self.tracer.trace_entry(self)
+            self.next_token(ri)
+            key = self.memokey()
 
-            if ri.is_lrec:
-                result = self.recursive_call(ri, key)
-            else:
-                result = self.rule_call(ri, key)
+            pos = self.pos
+            try:
+                self.tracer.trace_entry(self)
 
-            self.goto(result.newpos)
-            self.state.append(result.node)
+                if ri.is_lrec:
+                    result = self.recursive_call(ri, key)
+                else:
+                    result = self.rule_call(ri, key)
 
-            self.tracer.trace_success(self)
+                self.goto(result.newpos)
+                self.state.append(result.node)
 
-            return result.node
-        except FailedParse as e:
-            self.goto(pos)
-            self.set_furthest_exception(e)
-            self.tracer.trace_failure(self, e)
-            raise
+                self.tracer.trace_success(self)
+
+                return result.node
+            except FailedParse as e:
+                self.goto(pos)
+                self.set_furthest_exception(e)
+                self.tracer.trace_failure(self, e)
+                raise
         finally:
             if ri.should_trace:
                 self.callstack.pop()
+            self._leave_rule_call()
 
     def recursive_call(self, ri: RuleInfo, key: MemoKey) -> RuleResult:
         if not ri.is_lrec:

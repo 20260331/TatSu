@@ -10,6 +10,10 @@ from typing import Any
 
 from ..config import ParserConfig
 from ..exceptions import (
+    BUDGET_MEMO_ENTRIES,
+    BUDGET_RECURSION_DEPTH,
+    BUDGET_RULE_CALLS,
+    BudgetExceeded,
     FailedLeftRecursion,
     FailedParse,
     HeartDied,
@@ -95,6 +99,53 @@ class ParserCore(Ctx):
         )
         self._results: MemoCache = {}
         self.states = ParseStateStack(cursor=self.input.newcursor())
+
+        self._budget: int | None = self.config.budget
+        self._rule_calls: int = 0
+        self._rule_depth: int = 0
+        self._memo_entries: int = 0
+
+    def _budget_exceeded(
+        self,
+        resource: str,
+        used: int,
+        ri: RuleInfo | None = None,
+    ) -> BudgetExceeded:
+        return BudgetExceeded(
+            self.cursor,
+            self.callstack,
+            resource=resource,
+            budget=self._budget or 0,
+            used=used,
+            rule=ri.name if ri is not None else None,
+        )
+
+    def _enter_rule_call(self, ri: RuleInfo) -> None:
+        # NOTE: called from ParserEngine.call() before any parsing work,
+        # so an exhausted budget aborts the rule before it takes effect.
+        budget = self._budget
+        if budget is None:
+            return
+
+        self._rule_depth += 1
+        if self._rule_depth > budget:
+            raise self._budget_exceeded(BUDGET_RECURSION_DEPTH, self._rule_depth, ri)
+
+        self._rule_calls += 1
+        if self._rule_calls > budget:
+            raise self._budget_exceeded(BUDGET_RULE_CALLS, self._rule_calls, ri)
+
+    def _leave_rule_call(self) -> None:
+        if self._budget is not None and self._rule_depth > 0:
+            self._rule_depth -= 1
+
+    def _charge_memo(self, ri: RuleInfo) -> None:
+        budget = self._budget
+        if budget is None:
+            return
+        self._memo_entries += 1
+        if self._memo_entries > budget:
+            raise self._budget_exceeded(BUDGET_MEMO_ENTRIES, self._memo_entries, ri)
 
     def _reset(self) -> None:
         self._initialize_caches()
@@ -269,5 +320,6 @@ class ParserCore(Ctx):
         memo: RuleResult | ParseException,
     ) -> RuleResult | ParseException:
         if key.ruleinfo.memoizable and self.config.memoization:
+            self._charge_memo(key.ruleinfo)
             self._memos[key] = memo
         return memo

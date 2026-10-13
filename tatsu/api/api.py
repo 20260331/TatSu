@@ -142,12 +142,16 @@ def parse(
     **settings: Any,
 ) -> Any:
     filename = filename or settings.pop('source', None)
+    # NOTE: the budget bounds the parsing of ``text`` only, never the
+    # internal parse that compiles ``grammar``.
+    budget = settings.pop('budget', None)
     config = ParserConfig.new(
         config=config,
         start=start,
         name=name,
         source=filename,
         semantics=semantics,
+        budget=budget,
         **settings,
     )
     model = compile(grammar, config=config, asmodel=asmodel)

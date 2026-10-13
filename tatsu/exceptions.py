@@ -12,6 +12,67 @@ class TatSuException(Exception):
     pass
 
 
+# Per-parse resource budget categories
+BUDGET_RULE_CALLS = 'rule call'
+BUDGET_RECURSION_DEPTH = 'recursion depth'
+BUDGET_MEMO_ENTRIES = 'memo entry'
+
+
+class BudgetExceeded(TatSuException):
+    """Raised when the per-parse resource budget is exhausted.
+
+    This is a fatal error raised before the offending operation takes
+    effect.  It is deliberately NOT a subclass of ``ParseException`` so
+    that options, choices, lookaheads, and error recovery cannot
+    backtrack over or swallow it.
+    """
+
+    def __init__(
+        self,
+        cursor: Cursor,
+        stack: list[RuleInfo],
+        resource: str,
+        budget: int,
+        used: int,
+        rule: str | None = None,
+    ) -> None:
+        # NOTE:
+        #  Keep all state in positional arguments for pickling, like
+        #  FailedParse does.
+        super().__init__(cursor, stack, resource, budget, used)
+
+        self.cursor = cursor.clone()
+        self.info: LineInfo = cursor.lineinfo()
+        self.resource = resource
+        self.budget = budget
+        self.used = used
+        self.stack = [ri.name for ri in stack]
+        self.rule = rule or (self.stack[-1] if self.stack else None)
+
+    @property
+    def pos(self) -> int:
+        return self.cursor.pos
+
+    @property
+    def message(self) -> str:
+        msg = f'{self.resource} budget exceeded: {self.used} of {self.budget}'
+        if self.rule:
+            msg += f" at rule '{self.rule}'"
+        return msg
+
+    def render(self, color: Color = MEMENTO_DEFAULT_COLOR) -> str:
+        return memento(
+            self.message,
+            self.cursor.textstr,
+            self.info,
+            self.stack,
+            color=color,
+        )
+
+    def __str__(self) -> str:
+        return self.render()
+
+
 class ParseException(TatSuException):
     pass
 
