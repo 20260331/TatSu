@@ -35,16 +35,28 @@ class Choice(Model):
 
     def _parse(self, ctx: Ctx) -> Any:
         # ctx.expecting(*self.expecting)
-        for o in self.options:
+        cov = ctx.coverage
+        for option_index, o in enumerate(self.options):
             ctx.states.push()
+            if cov is not None:
+                cov.frame_open()
             o._add_defined(ctx)
             exp = o.exp if isinstance(o, Option) else o
             try:
                 value = exp._parse(ctx)
                 ctx.states.merge()
+                if cov is not None:
+                    cov.frame_commit()
+                    cov.branch_taken(
+                        cov.model_choice_id(self, ctx),
+                        option_index,
+                    )
                 return value
             except FailedParse:
-                if ctx.states.undo().cutseen:
+                state = ctx.states.undo()
+                if cov is not None:
+                    cov.frame_rollback()
+                if state.cutseen:
                     raise
         raise ctx.newexcept(self.expectingstr)
 

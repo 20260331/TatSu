@@ -42,6 +42,10 @@ class ParserConfig(Config):
     trace_length: int = 72
     trace_separator: str = C_DERIVE
 
+    # final-derivation coverage: a DerivationCoverage instance, True for a
+    # parser-local recorder, or None/False to disable recording
+    derivation_coverage: Any = None
+
     # parser directives
     grammar: str | None = None
     left_recursion: bool = True

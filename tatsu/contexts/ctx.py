@@ -47,6 +47,7 @@ class CanParse(Protocol):
 @runtime_checkable
 class Ctx(CanParse, Protocol):
     states: ParseStateStack
+    coverage: Any
 
     @property
     def ast(self) -> AST: ...

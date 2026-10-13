@@ -60,7 +60,18 @@ class ParserEngine(ParserCore, CanParse):
         ):
             actual_start: str = self.config.effective_start_rule_name() or 'start'
             rule = self.find_rule(actual_start)
-            return rule(self)
+            cov = self.coverage
+            if cov is not None:
+                cov.begin_parse()
+            try:
+                result = rule(self)
+            except BaseException:
+                if cov is not None:
+                    cov.discard_parse()
+                raise
+            if cov is not None:
+                cov.commit_parse()
+            return result
 
     @contextmanager
     def bound(
@@ -85,6 +96,7 @@ class ParserEngine(ParserCore, CanParse):
         self.lastbeat_pos: int = 0
         self._furthest_exception = None
         self.update_tracer()
+        self._set_coverage(config.derivation_coverage)
         try:
             if isinstance(text, Text):
                 input = text
@@ -123,6 +135,9 @@ class ParserEngine(ParserCore, CanParse):
         key = self.memokey()
 
         pos = self.pos
+        cov = self.coverage
+        if cov is not None:
+            cov.frame_open()
         try:
             self.tracer.trace_entry(self)
 
@@ -131,13 +146,20 @@ class ParserEngine(ParserCore, CanParse):
             else:
                 result = self.rule_call(ri, key)
 
+            if cov is not None:
+                cov.rule_succeeded(key, ri.name)
+
             self.goto(result.newpos)
             self.state.append(result.node)
 
             self.tracer.trace_success(self)
 
+            if cov is not None:
+                cov.frame_commit()
             return result.node
         except FailedParse as e:
+            if cov is not None:
+                cov.frame_rollback()
             self.goto(pos)
             self.set_furthest_exception(e)
             self.tracer.trace_failure(self, e)
@@ -154,6 +176,9 @@ class ParserEngine(ParserCore, CanParse):
 
         result: RuleResult | ParseException | None = self._results.get(key)
         if isinstance(result, RuleResult):
+            cov = self.coverage
+            if cov is not None:
+                cov.memo_adopted(key)
             return result
         elif isinstance(result, Exception):
             raise result
@@ -190,6 +215,9 @@ class ParserEngine(ParserCore, CanParse):
         if isinstance(result, Exception):
             raise result
         if isinstance(result, RuleResult):
+            cov = self.coverage
+            if cov is not None:
+                cov.memo_adopted(key)
             return result
 
         self.set_left_recursion_guard(key)

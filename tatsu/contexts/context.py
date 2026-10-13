@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: BSD-4-Clause
 from __future__ import annotations
 
+import sys
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
+from pathlib import Path
+from types import FrameType
 from typing import Any
 
 from ..exceptions import (
@@ -175,25 +178,55 @@ class ParseContext(ParserEngine):
 
     @contextmanager
     def option(self) -> Any:
+        cov = self.coverage
+        if cov is not None:
+            cov.frame_open()
         self.states.push()
         try:
             yield
             self.states.merge()
+            if cov is not None:
+                cov.frame_commit()
             raise OptionSucceeded()
         except FailedParse:
-            if self.states.undo().cutseen:
+            state = self.states.undo()
+            if cov is not None:
+                cov.frame_rollback()
+            if state.cutseen:
                 raise
 
     _option = option
 
     @contextmanager
     def choice(self) -> Generator[ChoiceContext, Any, Any]:
-        chc = ChoiceContext(self)
+        cov = self.coverage
+        choice_id = self._coverage_choice_id() if cov is not None else ''
+        chc = ChoiceContext(self, choice_id=choice_id)
         with suppress(OptionSucceeded):
             yield chc
             chc.parse(self)
 
     _choice = choice
+
+    def _coverage_choice_id(self) -> str:
+        contexts_dir = Path(__file__).parent
+        frame: FrameType | None = sys._getframe(1)
+        while frame is not None and (
+            Path(frame.f_code.co_filename).parent == contexts_dir
+            or Path(frame.f_code.co_filename).name == 'contextlib.py'
+        ):
+            frame = frame.f_back
+        if frame is not None:
+            lineno = frame.f_lineno
+            fallback_rule = frame.f_code.co_name
+        else:  # pragma: no cover
+            lineno = 0
+            fallback_rule = '?'
+        if self.callstack:
+            rule_name = self.callstack[-1].name
+        else:
+            rule_name = fallback_rule
+        return f'{rule_name}:{lineno}'
 
     @contextmanager
     def optional(self) -> Any:
@@ -206,12 +239,20 @@ class ParseContext(ParserEngine):
         #   The OptionSucceeded exception is just the legacy way of the library
         #   to manage the control flow on success (some versions of the library
         #   have just returned).
+        cov = self.coverage
+        if cov is not None:
+            cov.frame_open()
         self.states.push()
         try:
             yield
             self.states.merge()
+            if cov is not None:
+                cov.frame_commit()
         except FailedParse:
-            if self.states.undo().cutseen:
+            state = self.states.undo()
+            if cov is not None:
+                cov.frame_rollback()
+            if state.cutseen:
                 raise
 
     _optional = optional
@@ -234,11 +275,16 @@ class ParseContext(ParserEngine):
 
     @contextmanager
     def if_(self) -> Any:
+        cov = self.coverage
+        if cov is not None:
+            cov.frame_open()
         self.states.push()
         try:
             yield
         finally:
             self.states.undo()
+            if cov is not None:
+                cov.frame_rollback()
 
     _if = if_
 
@@ -287,14 +333,25 @@ class ParseContext(ParserEngine):
             raise
 
     def isolate(self, exp: Func) -> Any:
+        cov = self.coverage
+        if cov is not None:
+            cov.frame_open()
         self.states.push()
+        succeeded = False
         try:
             self.expcall(exp)
-            return cstfinal(self.cst)
+            result = cstfinal(self.cst)
+            succeeded = True
+            return result
         finally:
             ast = self.ast
             self.states.pop()
             self.ast = ast
+            if cov is not None:
+                if succeeded:
+                    cov.frame_commit()
+                else:
+                    cov.frame_rollback()
 
     _isolate = isolate
 

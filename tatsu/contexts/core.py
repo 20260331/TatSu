@@ -9,6 +9,7 @@ from functools import cache
 from typing import Any
 
 from ..config import ParserConfig
+from ..coverage import DerivationCoverage
 from ..exceptions import (
     FailedLeftRecursion,
     FailedParse,
@@ -57,6 +58,7 @@ def find_cached_semantic_action(semantics: Any, name: str) -> Callable[..., Any]
 
 class ParserCore(Ctx):
     states: ParseStateStack  # type: ignore
+    coverage: DerivationCoverage | None
 
     def __init__(
         self,
@@ -82,6 +84,7 @@ class ParserCore(Ctx):
         self._furthest_exception: FailedParse | None = None
 
         self._initialize_caches()
+        self.coverage: DerivationCoverage | None = None
         self.tracer: Tracer = NullTracer()
         self.heart: Heart | None = config.heart
         self.lastbeat_time = 0.0
@@ -151,6 +154,15 @@ class ParserCore(Ctx):
     def callstack(self) -> list[RuleInfo]:
         return self.states.callstack
 
+    def _set_coverage(self, requested: Any) -> None:
+        if isinstance(requested, DerivationCoverage):
+            self.coverage = requested
+        elif requested:
+            if not isinstance(self.coverage, DerivationCoverage):
+                self.coverage = DerivationCoverage()
+        else:
+            self.coverage = None
+
     def update_tracer(self) -> Tracer:
         if self.active_config.trace:
             tracer: Tracer = ConsoleTracer(config=self.config)
@@ -212,15 +224,24 @@ class ParserCore(Ctx):
 
     @contextmanager
     def statescope(self, *, merge: bool = True) -> Generator[ParseState, None, None]:
+        cov = self.coverage
+        if cov is not None:
+            cov.frame_open()
         self.states.push()
         try:
             yield self.state
             if merge:
                 self.states.merge()
+                if cov is not None:
+                    cov.frame_commit()
             else:
                 self.states.pop()
+                if cov is not None:
+                    cov.frame_rollback()
         except FailedParse:
             self.states.undo()
+            if cov is not None:
+                cov.frame_rollback()
             raise
 
     def cut(self) -> None:

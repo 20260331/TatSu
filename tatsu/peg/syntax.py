@@ -93,14 +93,22 @@ class SkipTo(Box):
 @nodedataclass
 class Optional(Box):
     def _parse(self, ctx: Ctx) -> Any:
+        cov = ctx.coverage
         ctx.states.push()
+        if cov is not None:
+            cov.frame_open()
         try:
             self._add_defined(ctx)
             value = self.exp._parse(ctx)
             ctx.states.merge()
+            if cov is not None:
+                cov.frame_commit()
             return value
         except FailedParse:
-            if ctx.states.undo().cutseen:
+            state = ctx.states.undo()
+            if cov is not None:
+                cov.frame_rollback()
+            if state.cutseen:
                 raise
             return None
 

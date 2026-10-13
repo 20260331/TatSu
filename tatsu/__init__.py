@@ -19,6 +19,12 @@ from .api import (
 )  # pylint: disable=W0622
 from .contexts import ast as ast
 from .contexts.decorator import isname, leftrec, name, nomemo, rule, tatsumasu
+from .coverage import (
+    CorpusReduction,
+    DerivationCoverage,
+    coverage_of,
+    reduce_corpus,
+)
 from .input import buffer as buffer, buffer as buffering, textlines as textlines
 from .objectmodel import (
     NodeDataclassParams,
@@ -49,12 +55,16 @@ sys.modules.update(  # noqa: RUF067
 __all__ = [
     '__toolname__',
     '__version__',
+    'CorpusReduction',
+    'DerivationCoverage',
     'compile_to_parser',
+    'coverage_of',
     'builder',
     'compile',
     'gencode',
     'genmodel',
     'parse',
+    'reduce_corpus',
     'tatsu_main',
     'to_grammar_json',
     'to_python_model',
