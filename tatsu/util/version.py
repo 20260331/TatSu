@@ -117,7 +117,7 @@ class Version:
                 return None, None  # type: ignore
 
             alpha = ''.join(takewhile(str.isalpha, s))
-            digits = s[len(alpha) :]
+            digits = s[len(alpha) :].lstrip(r'_-.')
             if digits.isdigit():
                 digits = int(digits)  # type: ignore
             return alpha, digits

@@ -10,6 +10,7 @@ from ._version import __toolname__, __version__, version, version_info
 from .api import (
     compile,
     compile_to_parser,
+    generate,
     gencode,
     genmodel,
     parse,
@@ -53,6 +54,7 @@ __all__ = [
     'builder',
     'compile',
     'gencode',
+    'generate',
     'genmodel',
     'parse',
     'tatsu_main',

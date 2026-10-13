@@ -172,6 +172,47 @@ def parse(
     return model.parse(text, start=start, semantics=semantics, config=config)
 
 
+def generate(
+    grammar: str | Text,
+    /,
+    *,
+    count: int = 5,
+    max_depth: int = 4,
+    attempts: int = 300,
+    start: str | None = None,
+    name: str | None = None,
+    filename: str | None = None,
+    config: ParserConfig | None = None,
+    **settings: Any,
+) -> list[str]:
+    """Generate up to ``count`` finite legal inputs for ``grammar``.
+
+    The grammar is compiled, and candidate strings are produced by
+    bounded unfolding (``max_depth``).  A candidate is returned only if
+    the grammar's own parser accepts it, and verification never runs
+    user semantics.
+
+    :param count: maximum number of distinct samples to return.
+    :param max_depth: maximum nested rule-call unfolding depth.
+    :param attempts: maximum number of candidates verified.
+    :param start: name of the start rule (defaults to the grammar's).
+    """
+    filename = filename or settings.pop('source', None)
+    model = compile(
+        grammar,
+        name=name,
+        filename=filename,
+        config=config,
+        **settings,
+    )
+    return model.generate_samples(
+        count=count,
+        max_depth=max_depth,
+        attempts=attempts,
+        start=start,
+    )
+
+
 def to_python_sourcecode(
     grammar: str,
     /,

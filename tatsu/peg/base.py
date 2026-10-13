@@ -676,6 +676,28 @@ class Grammar(Model):
     def newctx(self, asmodel: bool = True) -> Ctx:
         return ModelContext(self.rules, config=self.config, asmodel=asmodel)
 
+    def generate_samples(
+        self,
+        *,
+        count: int = 5,
+        max_depth: int = 4,
+        attempts: int = 300,
+        start: str | None = None,
+    ) -> list[str]:
+        """Generate finite inputs accepted by this grammar.
+
+        Every returned string is verified by parsing it from ``start``
+        without executing user semantics. See
+        :class:`tatsu.generation.SampleGenerator` for details.
+        """
+        from ..generation import SampleGenerator
+
+        return SampleGenerator(self, start=start).generate(
+            count=count,
+            max_depth=max_depth,
+            attempts=attempts,
+        )
+
     def new_parse_config(
         self,
         /,
