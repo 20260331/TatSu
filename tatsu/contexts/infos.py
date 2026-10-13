@@ -20,6 +20,11 @@ class MemoKey(NamedTuple):
 class RuleResult(NamedTuple):
     node: Any
     newpos: int
+    # NOTE: deferred semantic actions registered while building this
+    # result. They are re-adopted whenever a memoized result is adopted
+    # by a derivation, and committed only if that derivation survives to
+    # the end of a successful parse.
+    deferred: tuple[Callable[[], Any], ...] = ()
 
 
 class RuleLike(Protocol):

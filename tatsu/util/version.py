@@ -49,6 +49,7 @@ VERSION_PATTERN = r"""(?x)
         )?
     )
     (?:\+(?P<local>[a-z0-9]+(?:[-_\.][a-z0-9]+)*))?       # local version
+    \Z
 """
 
 STRIC_VERSION_RE = r'''(?x)
@@ -126,13 +127,19 @@ class Version:
         release = tuple(int(d) for d in parts['release'].split('.'))
         parts['release'] = release
 
-        pre = parts['pre'] or ''
-        pre, num = alphadigit_split(pre.lstrip('_-.'))
-        pre = LETTER_NORMALIZATION.get(pre, pre)
-        pre = (pre, num)
-        parts['pre'] = pre
-        level, serial = pre
-        serial = int(serial) if serial else None  # type: ignore
+        # NOTE: use the groups captured by the regex; the pre-release
+        # number may be separated from its letter by '.', '_' or '-',
+        # which splitting the whole match by hand fails on ('b.1').
+        pre_label = parts['pre_l']
+        if pre_label:
+            pre_label = LETTER_NORMALIZATION.get(pre_label, pre_label)
+            pre_num = parts['pre_n']
+            level: str | None = pre_label
+            serial: int | None = int(pre_num) if pre_num else None
+        else:
+            level = None
+            serial = None
+        parts['pre'] = (level, serial)
 
         major, minor, micro, *nano = release + (None,) * 3
         nano = tuple(int(n) for n in nano if n is not None) or None  # type: ignore

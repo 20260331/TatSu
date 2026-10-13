@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: BSD-4-Clause
 from __future__ import annotations
 
+import builtins
 import sys
+import types
 
 import pytest
 
 import tatsu
 from tatsu.api import compile, parse
-from tatsu.exceptions import FailedParse, FailedToken
+from tatsu.exceptions import FailedParse, FailedSemantics, FailedToken
 from tatsu.objectmodel import Node, synth
 from tatsu.objectmodel.builder import (
     BuilderConfig,
@@ -333,6 +335,312 @@ def test_cut_scope():
     with pytest.raises(FailedToken, match=r"expecting 'b'"):
         ast = parse(grammar, 'a c d')
         assert ast == ['a', 'c', 'd']
+
+
+# --- Deferred (committed) semantic actions ---------------------------------
+
+
+def _generated_parser(grammar):
+    code = tatsu.to_python_sourcecode(grammar, name='DeferredTest')
+    module = types.ModuleType('test_deferred_generated')
+    module.__file__ = '<generated>'
+    exec(  # noqa: S102
+        builtins.compile(code, module.__file__, 'exec'),
+        module.__dict__,
+    )
+    return module.DeferredTestParser()
+
+
+class _Recorder:
+    """Records both immediate action effects and deferred commits."""
+
+    def __init__(self):
+        self.immediate: list[str] = []
+        self.committed: list[str] = []
+        self.ctx = None
+
+    def set_context(self, ctx):
+        self.ctx = ctx
+
+    def _note(self, label: str):
+        self.immediate.append(label)
+        assert self.ctx is not None
+        self.ctx.defer(self.committed.append, label)
+
+
+ORDER_GRAMMAR = r"""
+    start = a b $ ;
+    a = 'a' ;
+    b = 'b' ;
+"""
+
+
+class OrderSemantics(_Recorder):
+    def a(self, ast):
+        self._note('a')
+        return ast
+
+    def b(self, ast):
+        self._note('b')
+        return ast
+
+
+@pytest.mark.parametrize('generated', [False, True])
+def test_deferred_commit_after_success_in_order(generated):
+    parser = (
+        _generated_parser(ORDER_GRAMMAR)
+        if generated
+        else compile(ORDER_GRAMMAR, 'DeferredTest')
+    )
+    semantics = OrderSemantics()
+
+    result = parser.parse('a b', semantics=semantics)
+    assert result == ['a', 'b']
+
+    # actions run while parsing; deferred callbacks after the parse, in order
+    assert semantics.immediate == ['a', 'b']
+    assert semantics.committed == ['a', 'b']
+
+
+FAILED_CHOICE_GRAMMAR = r"""
+    start = choice $ ;
+    choice = probe 'x' | 'g' ;
+    probe = 'g' ;
+"""
+
+
+class FailedChoiceSemantics(_Recorder):
+    def probe(self, ast):
+        self._note('probe')
+        return ast
+
+
+@pytest.mark.parametrize('generated', [False, True])
+def test_deferred_dropped_for_failed_choice(generated):
+    parser = (
+        _generated_parser(FAILED_CHOICE_GRAMMAR)
+        if generated
+        else compile(FAILED_CHOICE_GRAMMAR, 'DeferredTest')
+    )
+    semantics = FailedChoiceSemantics()
+
+    parser.parse('g', semantics=semantics)
+
+    # the action ran while trying the abandoned option,
+    # but its deferred callback is never committed
+    assert semantics.immediate == ['probe']
+    assert semantics.committed == []
+
+
+LOOKAHEAD_GRAMMAR = r"""
+    start = &probe 'g' $ ;
+    probe = 'g' ;
+"""
+
+
+class LookaheadSemantics(_Recorder):
+    def probe(self, ast):
+        self._note('probe')
+        return ast
+
+
+@pytest.mark.parametrize('generated', [False, True])
+def test_deferred_dropped_for_lookahead(generated):
+    parser = (
+        _generated_parser(LOOKAHEAD_GRAMMAR)
+        if generated
+        else compile(LOOKAHEAD_GRAMMAR, 'DeferredTest')
+    )
+    semantics = LookaheadSemantics()
+
+    parser.parse('g', semantics=semantics)
+
+    assert semantics.immediate == ['probe']
+    assert semantics.committed == []
+
+
+MEMO_GRAMMAR = r"""
+    start = choice $ ;
+    choice = probe 'x' | probe 'g' ;
+    probe = 'g' ;
+"""
+
+
+class MemoSemantics(_Recorder):
+    def probe(self, ast):
+        self._note('probe')
+        return ast
+
+
+@pytest.mark.parametrize('generated', [False, True])
+def test_deferred_readopted_from_memo(generated):
+    parser = (
+        _generated_parser(MEMO_GRAMMAR)
+        if generated
+        else compile(MEMO_GRAMMAR, 'DeferredTest')
+    )
+    semantics = MemoSemantics()
+
+    # NOTE: whitespace separates the tokens ('g' is a token name)
+    parser.parse('g g', semantics=semantics)
+
+    # the action ran only once, but the memoized result is adopted by the
+    # winning alternative, so its callback commits exactly once
+    assert semantics.immediate == ['probe']
+    assert semantics.committed == ['probe']
+
+
+CLOSURE_GRAMMAR = r"""
+    start = {item}+ $ ;
+    item = /\d/ ;
+"""
+
+
+class ClosureSemantics(_Recorder):
+    def item(self, ast):
+        self._note(ast)
+        return ast
+
+
+@pytest.mark.parametrize('generated', [False, True])
+def test_deferred_committed_for_every_closure_iteration(generated):
+    parser = (
+        _generated_parser(CLOSURE_GRAMMAR)
+        if generated
+        else compile(CLOSURE_GRAMMAR, 'DeferredTest')
+    )
+    semantics = ClosureSemantics()
+
+    parser.parse('123', semantics=semantics)
+
+    assert semantics.immediate == ['1', '2', '3']
+    assert semantics.committed == ['1', '2', '3']
+
+
+LEFTREC_GRAMMAR = r"""
+    start = e $ ;
+    e = e '+' n | n ;
+    n = /\d/ ;
+"""
+
+
+class LeftRecSemantics(_Recorder):
+    def n(self, ast):
+        self._note(f'n:{ast}')
+        return ast
+
+    def e(self, ast):
+        label = 'e:base' if ast == '1' else 'e:grow'
+        self._note(label)
+        return ast
+
+
+@pytest.mark.parametrize('generated', [False, True])
+def test_deferred_leftrecursion_intermediates(generated):
+    parser = (
+        _generated_parser(LEFTREC_GRAMMAR)
+        if generated
+        else compile(LEFTREC_GRAMMAR, 'DeferredTest')
+    )
+    semantics = LeftRecSemantics()
+
+    parser.parse('1+2', semantics=semantics)
+
+    # the semantic action runs on every left-recursion growth step,
+    # including the final attempt that does not extend the match;
+    # its deferred callback is the one that gets discarded
+    assert semantics.immediate == [
+        'n:1',
+        'e:base',
+        'n:2',
+        'e:grow',
+        'e:base',
+    ]
+    # only callbacks of the adopted derivation commit,
+    # in derivation order and without duplicates
+    assert semantics.committed == ['n:1', 'e:base', 'n:2', 'e:grow']
+
+
+FAIL_GRAMMAR = r"""
+    start = a b $ ;
+    a = 'a' ;
+    b = 'b' ;
+"""
+
+
+class FailSemantics(_Recorder):
+    def a(self, ast):
+        self._note('a')
+        return ast
+
+    def b(self, ast):
+        self._note('b')
+        return ast
+
+
+def test_deferred_rolled_back_when_parse_fails():
+    model = compile(FAIL_GRAMMAR, 'DeferredTest')
+    semantics = FailSemantics()
+
+    with pytest.raises(FailedParse):
+        model.parse('a x', semantics=semantics)
+
+    assert semantics.immediate == ['a']
+    assert semantics.committed == []
+
+
+class FailedSemanticsSemantics(_Recorder):
+    def a(self, _ast):
+        raise FailedSemantics('no a')
+
+    def b(self, ast):
+        self._note('b')
+        return ast
+
+
+def test_failed_semantics_does_not_commit():
+    model = compile(FAIL_GRAMMAR, 'DeferredTest')
+    semantics = FailedSemanticsSemantics()
+
+    with pytest.raises(FailedParse):
+        model.parse('a b', semantics=semantics)
+
+    assert semantics.committed == []
+
+
+class RaisingDeferredSemantics(FailSemantics):
+    def a(self, ast):
+        self.immediate.append('a')
+        self.ctx.defer(self._boom)
+        return ast
+
+    def _boom(self):
+        raise RuntimeError('commit failed')
+
+
+def test_deferred_callback_exception_propagates():
+    model = compile(FAIL_GRAMMAR, 'DeferredTest')
+    semantics = RaisingDeferredSemantics()
+
+    with pytest.raises(RuntimeError, match='commit failed'):
+        model.parse('a b', semantics=semantics)
+
+    assert semantics.immediate == ['a', 'b']
+    assert semantics.committed == []
+
+
+def test_deferred_reset_between_parses():
+    model = compile(ORDER_GRAMMAR, 'DeferredTest')
+    semantics = OrderSemantics()
+
+    model.parse('a b', semantics=semantics)
+    assert semantics.committed == ['a', 'b']
+
+    with pytest.raises(FailedParse):
+        model.parse('a x', semantics=semantics)
+
+    # the failed second parse must not leave callbacks behind
+    assert semantics.committed == ['a', 'b']
 
 
 if __name__ == '__main__':

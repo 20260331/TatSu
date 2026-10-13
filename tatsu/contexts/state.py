@@ -2,12 +2,17 @@
 # SPDX-License-Identifier: BSD-4-Clause
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, Self, overload
 
 from .ast import AST
 from .cst import cstadd, cstfinal, cstmerge
 from .infos import Alert, RuleInfo
+
+
+# A semantic action may register zero-argument callbacks that must only
+# run if the derivation that registered them is part of the final parse.
+type DeferredAction = Callable[[], Any]
 
 
 __all__ = ['ParseState', 'ParseStateStack']
@@ -25,6 +30,7 @@ class ParseState:
         'cst',
         'cursor',
         'cutseen',
+        'deferred',
         'last_node',
     )
 
@@ -40,6 +46,11 @@ class ParseState:
         self.cutseen: bool = False
         self.last_node: Any = None
         self.alerts: list[Alert] = []
+        # NOTE: callbacks registered with Ctx.defer(); each pushed scope
+        # starts with an empty list, which is adopted on merge/pop and
+        # discarded on undo (failed options, lookahead, left-recursion
+        # growth that is later superseded).
+        self.deferred: list[DeferredAction] = []
 
     def clone(self) -> Self:
         return type(self)(self)
@@ -53,6 +64,7 @@ class ParseState:
         self.ast = prev.ast
         self.extend(prev.cst)
         self.alerts.extend(prev.alerts)
+        self.deferred.extend(prev.deferred)
         self.cursor.goto(prev.cursor.pos)
         return self
 
@@ -151,6 +163,15 @@ class ParseStateStack:
         self.state.cursor.goto(prev.cursor.pos)
         return prev
 
+    def pop_adopt(self) -> ParseState:
+        # NOTE: like pop(), but the popped scope parsed successfully and
+        # remains part of the derivation even though its value is
+        # discarded (isolate/skip groups): adopt its deferred actions.
+        prev = self.state_stack.pop()
+        self.state.deferred.extend(prev.deferred)
+        self.state.cursor.goto(prev.cursor.pos)
+        return prev
+
     def new(self) -> ParseState:
         newstate = ParseState(self.state.cursor)
         self.state_stack.append(newstate)
@@ -165,6 +186,26 @@ class ParseStateStack:
     def merge(self) -> ParseState:
         prev = self.pop()
         return self.state.merge(prev)
+
+    def defer(self, callback: DeferredAction) -> None:
+        self.state.deferred.append(callback)
+
+    def adopt(self, callbacks: Iterable[DeferredAction]) -> None:
+        # NOTE: adopt callbacks frozen into a memoized rule result
+        self.state.deferred.extend(callbacks)
+
+    def adopt_scratch(self) -> None:
+        # NOTE: rule_call() evaluates rules on a scratch state created
+        # with .new(); hand its deferred callbacks to the caller state
+        # below before the scratch is undone.
+        self.state_stack[-2].deferred.extend(self.state.deferred)
+
+    def drain_committed(self) -> list[DeferredAction]:
+        # NOTE: everything left in the root state belongs to derivations
+        # adopted by the final, successful parse.
+        committed = self.state_stack[0].deferred
+        self.state_stack[0].deferred = []
+        return committed
 
     def alert(self, level: int = 1, message: str = '') -> Alert:
         self.state.alerts.append(Alert(level=level, message=message))

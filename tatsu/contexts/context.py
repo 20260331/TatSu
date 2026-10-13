@@ -293,7 +293,7 @@ class ParseContext(ParserEngine):
             return cstfinal(self.cst)
         finally:
             ast = self.ast
-            self.states.pop()
+            self.states.pop_adopt()
             self.ast = ast
 
     _isolate = isolate

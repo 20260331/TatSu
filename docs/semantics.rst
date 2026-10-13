@@ -72,6 +72,48 @@ as:
     def preproc(self, ast):
         ...
 
+Deferred Actions
+~~~~~~~~~~~~~~~~
+
+Semantic actions run as soon as their rule matches, even while the
+parser is trying alternatives that fail later, while evaluating
+lookahead, or on the intermediate results of left-recursion growth.
+Actions with external side effects (appending to a list, emitting code,
+updating a symbol table) may therefore observe attempts that do not
+belong to the final parse.
+
+For those effects, the parse context provides ``defer()``. A callback
+registered with ``defer()`` is held until the whole parse succeeds and
+the derivation that registered it is the one adopted. The callbacks
+then run, in registration order, after parsing finishes and before
+``parse()`` returns:
+
+.. code:: python
+
+    class MySemantics:
+        def set_context(self, ctx):
+            self.ctx = ctx
+
+        def some_rule_name(self, ast):
+            self.ctx.defer(self.commit_result, ast)
+            return ast
+
+        def commit_result(self, ast):
+            ...  # runs only if this derivation is adopted
+
+Call ``defer(callback, *args, **kwargs)`` to have arguments bound to
+the callback. Callbacks registered while parsing an alternative that
+fails, inside syntactic (``&``) or negative (``!``) lookahead, or on a
+left-recursion result that is later extended, are discarded. If the
+parse fails, no deferred callbacks run. A result that is reused from the
+packrat memo by an adopted derivation commits its callbacks exactly
+once.
+
+The semantics object receives the parse context through the standard
+``set_context()`` method. Deferred actions behave identically with a
+compiled grammar model and with a generated parser, as both share the
+same parse engine.
+
 
 .. _Abstract Syntax Tree: http://en.wikipedia.org/wiki/Abstract_syntax_tree
 .. _AST: http://en.wikipedia.org/wiki/Abstract_syntax_tree

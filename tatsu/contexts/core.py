@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-4-Clause
 from __future__ import annotations
 
+import functools
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -218,7 +219,7 @@ class ParserCore(Ctx):
             if merge:
                 self.states.merge()
             else:
-                self.states.pop()
+                self.states.pop_adopt()
         except FailedParse:
             self.states.undo()
             raise
@@ -245,6 +246,39 @@ class ParserCore(Ctx):
 
     def find_semantic_action(self, name: str) -> Callable[..., Any] | None:
         return find_cached_semantic_action(self.semantics, name)
+
+    def defer(
+        self,
+        callback: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Register a callback to run when the parse commits.
+
+        Semantic actions run as soon as their rule matches, including
+        while trying alternatives that later fail, inside lookahead, or
+        on intermediate left-recursion results. A callback registered
+        with ``defer()`` is held until the whole parse succeeds and the
+        derivation that registered it is the one adopted; callbacks then
+        run in registration order. Callbacks belonging to abandoned
+        derivations are silently discarded.
+        """
+        if args or kwargs:
+            callback = functools.partial(callback, *args, **kwargs)
+        self.states.defer(callback)
+
+    def commit_deferred(self) -> None:
+        callbacks = self.states.drain_committed()
+        # NOTE: the same frozen callback may be adopted more than once
+        # through memoized results; commit each one exactly a single time.
+        committed: set[int] = set()
+        for callback in callbacks:
+            marker = id(callback)
+            if marker in committed:
+                continue
+            committed.add(marker)
+            callback()
 
     def newexcept(
         self,

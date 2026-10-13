@@ -60,7 +60,9 @@ class ParserEngine(ParserCore, CanParse):
         ):
             actual_start: str = self.config.effective_start_rule_name() or 'start'
             rule = self.find_rule(actual_start)
-            return rule(self)
+            result = rule(self)
+            self.commit_deferred()
+            return result
 
     @contextmanager
     def bound(
@@ -154,6 +156,7 @@ class ParserEngine(ParserCore, CanParse):
 
         result: RuleResult | ParseException | None = self._results.get(key)
         if isinstance(result, RuleResult):
+            self.states.adopt(result.deferred)
             return result
         elif isinstance(result, Exception):
             raise result
@@ -166,17 +169,29 @@ class ParserEngine(ParserCore, CanParse):
         lastpos = -1
         while True:
             self.clear_recursion_errors()
+            # NOTE: isolate each growth attempt so deferred actions from
+            # iterations that fail or do not extend the match are dropped,
+            # including semantic actions that run on intermediate results.
+            self.states.push()
             try:
                 new_result = self.rule_call(ri, key)
-                self.goto(initial)
             except FailedParse:
+                self.states.undo()
                 break
+            except BaseException:
+                self.states.undo()
+                raise
+
+            self.goto(initial)
 
             if new_result.newpos > lastpos:
+                self.states.merge()
+                self.goto(initial)
                 self.save_result(key, new_result)
                 lastpos = new_result.newpos
                 result = new_result
             else:
+                self.states.undo()
                 break
 
         if isinstance(result, Exception):
@@ -190,6 +205,10 @@ class ParserEngine(ParserCore, CanParse):
         if isinstance(result, Exception):
             raise result
         if isinstance(result, RuleResult):
+            # NOTE: adopt the deferred actions frozen with this result when
+            # it was first derived; the enclosing scope drops them again
+            # if this branch of the parse is later abandoned.
+            self.states.adopt(result.deferred)
             return result
 
         self.set_left_recursion_guard(key)
@@ -202,9 +221,16 @@ class ParserEngine(ParserCore, CanParse):
             node = self.semantics_call(ri, node, pos=key.pos)
             self.set_parseinfo(node, ri.name, key.pos)
 
-            result = RuleResult(node, self.pos)
+            result = RuleResult(
+                node,
+                self.pos,
+                deferred=tuple(self.state.deferred),
+            )
             self.memoize(key, result)
-
+            # NOTE: the rule parsed and its result is returned to the
+            # caller; adopt its pending callbacks before the scratch
+            # state is undone (else does not run when try returns).
+            self.states.adopt_scratch()
             return result
         except FailedSemantics as e:
             ex = self.newexcept(str(e))
