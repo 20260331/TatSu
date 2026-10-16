@@ -51,6 +51,12 @@ class CodegenError(ParseError):
     pass
 
 
+class BundleError(TatSuException):
+    """Raised when a parser/model bundle is invalid, mixed, or corrupted."""
+
+    pass
+
+
 class FailedSemantics(ParseException):
     pass
 

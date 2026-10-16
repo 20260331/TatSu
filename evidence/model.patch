@@ -1,0 +1,910 @@
+diff --git a/tatsu/__init__.py b/tatsu/__init__.py
+index 73e10a36..ba9c23ec 100644
+--- a/tatsu/__init__.py
++++ b/tatsu/__init__.py
+@@ -8,14 +8,20 @@ from . import config as parserconfig, input as tokenizing
+ from ._grammar import grammar, grammar_path
+ from ._version import __toolname__, __version__, version, version_info
+ from .api import (
++    BundleError,
++    BundleInfo,
++    LoadedBundle,
+     compile,
+     compile_to_parser,
++    export_bundle,
+     gencode,
+     genmodel,
++    load_bundle,
+     parse,
+     to_grammar_json,
+     to_python_model,
+     to_python_sourcecode,
++    verify_bundle,
+ )  # pylint: disable=W0622
+ from .contexts import ast as ast
+ from .contexts.decorator import isname, leftrec, name, nomemo, rule, tatsumasu
+@@ -61,6 +67,12 @@ __all__ = [
+     'to_python_sourcecode',
+     'version',
+     'version_info',
++    'BundleError',
++    'BundleInfo',
++    'LoadedBundle',
++    'export_bundle',
++    'load_bundle',
++    'verify_bundle',
+     'isname',
+     'NodeDataclassParams',
+     'TatSuDataclassParams',
+diff --git a/tatsu/api/__init__.py b/tatsu/api/__init__.py
+index c7c546f4..ad477dd4 100644
+--- a/tatsu/api/__init__.py
++++ b/tatsu/api/__init__.py
+@@ -3,3 +3,9 @@
+ from __future__ import annotations
+ 
+ from .api import *  # noqa: F403
++
++
++# isort: split
++# ``tatsu.bundle`` imports ``tatsu.exceptions``; it must be imported after the
++# rest of the package to avoid a circular import through ``tatsu.contexts``.
++from ..bundle import *  # noqa: F403
+diff --git a/tatsu/bundle.py b/tatsu/bundle.py
+new file mode 100644
+index 00000000..3212aa9c
+--- /dev/null
++++ b/tatsu/bundle.py
+@@ -0,0 +1,432 @@
++# Copyright (c) 2017-2026 Juancarlo Añez (apalala@gmail.com)
++# SPDX-License-Identifier: BSD-4-Clause
++"""Relocatable bundles pairing a generated parser with its object model.
++
++A *bundle* is a directory containing a generated parser module, a generated
++object-model module, and a ``manifest.json`` describing the generation
++identity (grammar name, grammar hash, TatSu version) together with content
++checksums.  Both generated modules carry a matching bundle-identity marker,
++so files produced by different generations cannot be mixed unnoticed.
++
++Use :func:`export_bundle` to publish a bundle and :func:`load_bundle` to
++verify and load one.  Every load uses fresh, uniquely named modules, so two
++bundles generated from same-named grammars can coexist in a process without
++sharing classes or state.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import hmac
++import importlib.util
++import json
++import shutil
++import sys
++import tempfile
++import types
++import uuid
++from dataclasses import dataclass
++from datetime import UTC, datetime
++from pathlib import Path
++from typing import Any, TypeVar
++
++from ._version import version as tatsu_version
++from .exceptions import BundleError
++from .ngcodegen.ngmodel_gen import modelgen
++from .ngcodegen.ngparser_gen import pythongen
++from .objectmodel import Node
++from .objectmodel.builder import ModelBuilderSemantics
++from .parsing import Parser
++from .util import hasha
++
++
++__all__ = [
++    'BUNDLE_FORMAT',
++    'BUNDLE_VERSION',
++    'MANIFEST_FILENAME',
++    'BundleError',
++    'BundleInfo',
++    'LoadedBundle',
++    'export_bundle',
++    'load_bundle',
++    'verify_bundle',
++]
++
++BUNDLE_FORMAT = 'tatsu-parser-bundle'
++BUNDLE_VERSION = 1
++MANIFEST_FILENAME = 'manifest.json'
++PARSER_FILENAME = 'parser.py'
++MODEL_FILENAME = 'model.py'
++
++_ROLES = ('parser', 'model')
++_PATHS = {'parser': PARSER_FILENAME, 'model': MODEL_FILENAME}
++_T = TypeVar('_T')
++_MARKER_PREFIX = '# tatsu-bundle-'
++_MARKER_BEGIN = '# >>> tatsu parser bundle (generated, do not edit)'
++_MARKER_END = '# <<< tatsu parser bundle'
++
++
++@dataclass(frozen=True, slots=True)
++class BundleInfo:
++    """Information about a bundle written by :func:`export_bundle`."""
++
++    path: Path
++    bundle_id: str
++    grammar_name: str
++    manifest: dict[str, Any]
++
++
++@dataclass(frozen=True, slots=True)
++class LoadedBundle:
++    """A verified bundle together with its parser and model types.
++
++    ``model_module`` holds the generated model classes, while ``semantics``
++    is the generated ``ModelBuilderSemantics`` subclass to pass to the
++    parser.  :meth:`parse` wires both together as a convenience.
++    """
++
++    path: Path
++    bundle_id: str
++    grammar_name: str
++    manifest: dict[str, Any]
++    parser_module: types.ModuleType
++    model_module: types.ModuleType
++    parser: type[Parser]
++    semantics: type[ModelBuilderSemantics]
++
++    def parse(self, text: str, /, **settings: Any) -> Any:
++        """Parse ``text`` with the bundled parser and model semantics."""
++        semantics = settings.pop('semantics', None)
++        if semantics is None:
++            semantics = self.semantics()
++        return self.parser(semantics=semantics, **settings).parse(text)
++
++
++def export_bundle(
++    grammar: str,
++    outdir: str | Path,
++    /,
++    *,
++    name: str | None = None,
++    filename: str | None = None,
++    basetype: type = Node,
++    config: Any = None,
++    **settings: Any,
++) -> BundleInfo:
++    """Generate parser and object model, publishing them as a bundle.
++
++    The bundle is assembled in a temporary sibling directory and verified
++    before replacing ``outdir``.  A previously published bundle at
++    ``outdir`` is left untouched if generation fails.
++    """
++    outdir = Path(outdir)
++
++    # Local import to avoid an import cycle: tatsu.api imports this module.
++    from .api.api import compile
++
++    grammar_model = compile(
++        grammar,
++        name=name,
++        filename=filename,
++        config=config,
++        **settings,
++    )
++    grammar_name = grammar_model.name
++
++    parser_source = pythongen(grammar_model)
++    model_source = modelgen(grammar_model, name=grammar_name, basetype=basetype)
++
++    bundle_id = uuid.uuid4().hex
++    payload = {
++        'parser': _stamp(parser_source, bundle_id, grammar_name).encode('utf-8'),
++        'model': _stamp(model_source, bundle_id, grammar_name).encode('utf-8'),
++    }
++
++    files = {
++        role: {
++            'path': _PATHS[role],
++            'sha256': _sha256(payload[role]),
++        }
++        for role in _ROLES
++    }
++
++    manifest = {
++        'format': BUNDLE_FORMAT,
++        'bundle_version': BUNDLE_VERSION,
++        'bundle_id': bundle_id,
++        'grammar_name': grammar_name,
++        'grammar_sha256': hasha(grammar),
++        'tatsu_version': tatsu_version,
++        'generated_at': datetime.now(UTC).isoformat(timespec='seconds'),
++        'entries': {
++            'parser_class': f'{grammar_name}Parser',
++            'model_semantics_class': f'{grammar_name}ModelBuilderSemantics',
++        },
++        'files': files,
++    }
++
++    outdir.parent.mkdir(parents=True, exist_ok=True)
++    tmpdir = Path(
++        tempfile.mkdtemp(
++            dir=outdir.parent,
++            prefix=f'.{outdir.name}.',
++            suffix='.tmp',
++        ),
++    )
++    try:
++        for role in _ROLES:
++            (tmpdir / _PATHS[role]).write_bytes(payload[role])
++        (tmpdir / MANIFEST_FILENAME).write_text(
++            json.dumps(manifest, indent=2, sort_keys=True) + '\n',
++            encoding='utf-8',
++        )
++        verify_bundle(tmpdir)
++        _replace_directory(tmpdir, outdir)
++    except BaseException:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++        raise
++
++    return BundleInfo(
++        path=outdir,
++        bundle_id=bundle_id,
++        grammar_name=grammar_name,
++        manifest=manifest,
++    )
++
++
++def verify_bundle(path: str | Path) -> dict[str, Any]:
++    """Validate a bundle directory and return its manifest.
++
++    Raises :class:`BundleError` for missing files, checksum mismatches
++    (corruption), or files whose identity markers disagree with the
++    manifest or each other (files from different generations mixed).
++    """
++    bundle_dir = Path(path)
++    if not bundle_dir.is_dir():
++        raise BundleError(f'not a bundle directory: {bundle_dir}')
++
++    manifest_path = bundle_dir / MANIFEST_FILENAME
++    try:
++        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
++    except FileNotFoundError as e:
++        raise BundleError(f'missing bundle manifest: {manifest_path}') from e
++    except (OSError, json.JSONDecodeError) as e:
++        raise BundleError(
++            f'unreadable bundle manifest: {manifest_path}: {e}',
++        ) from e
++
++    if not isinstance(manifest, dict):
++        raise BundleError('the bundle manifest must be a JSON object')
++    if manifest.get('format') != BUNDLE_FORMAT:
++        raise BundleError(f'not a TatSu parser bundle: {manifest_path}')
++
++    bundle_version = manifest.get('bundle_version')
++    if (
++        not isinstance(bundle_version, int)
++        or isinstance(bundle_version, bool)
++        or not 0 < bundle_version <= BUNDLE_VERSION
++    ):
++        raise BundleError(f'unsupported bundle version: {bundle_version!r}')
++
++    bundle_id = manifest.get('bundle_id')
++    grammar_name = manifest.get('grammar_name')
++    if not isinstance(bundle_id, str) or not bundle_id:
++        raise BundleError('the bundle manifest is missing a valid "bundle_id"')
++    if not isinstance(grammar_name, str) or not grammar_name:
++        raise BundleError('the bundle manifest is missing a valid "grammar_name"')
++
++    files = manifest.get('files')
++    entries = manifest.get('entries')
++    if not isinstance(files, dict) or not isinstance(entries, dict):
++        raise BundleError('the bundle manifest has invalid "files" or "entries"')
++
++    marker_ids: dict[str, str] = {}
++    for role in _ROLES:
++        spec = files.get(role)
++        if not isinstance(spec, dict):
++            raise BundleError(f'the bundle manifest is missing the "{role}" file')
++        rel = spec.get('path')
++        checksum = spec.get('sha256')
++        if not isinstance(rel, str) or not isinstance(checksum, str):
++            raise BundleError(f'the bundle manifest has an invalid "{role}" entry')
++
++        member = _bundle_member(bundle_dir, rel)
++        if not member.is_file():
++            raise BundleError(f'missing bundle file: {rel}')
++
++        data = member.read_bytes()
++        if not hmac.compare_digest(_sha256(data), checksum):
++            raise BundleError(
++                f'checksum mismatch for {rel}: the file is corrupted or was '
++                'replaced by one from a different generation',
++            )
++
++        source = data.decode('utf-8', errors='replace')
++        marker_id = _read_marker(source, 'id')
++        marker_grammar = _read_marker(source, 'grammar')
++        if marker_id is None or marker_grammar is None:
++            raise BundleError(
++                f'{rel} has no bundle identity marker; it was likely produced '
++                'by a plain (unbundled) generation',
++            )
++        if marker_id != bundle_id:
++            raise BundleError(
++                f'{rel} belongs to another generation '
++                f'({marker_id[:8]} != {bundle_id[:8]}); refusing to mix bundles',
++            )
++        if marker_grammar != grammar_name:
++            raise BundleError(
++                f'{rel} was generated for grammar {marker_grammar!r}, but the '
++                f'bundle manifest declares {grammar_name!r}',
++            )
++        marker_ids[role] = marker_id
++
++    if marker_ids['parser'] != marker_ids['model']:
++        raise BundleError(
++            'the parser and the model come from different generations',
++        )
++
++    for key in ('parser_class', 'model_semantics_class'):
++        if not isinstance(entries.get(key), str) or not entries[key]:
++            raise BundleError(f'the bundle manifest is missing a valid "{key}"')
++
++    return manifest
++
++
++def load_bundle(path: str | Path) -> LoadedBundle:
++    """Verify and load a bundle, returning matching parser and model types."""
++    bundle_dir = Path(path)
++    manifest = verify_bundle(bundle_dir)
++    entries = manifest['entries']
++
++    modules = {
++        role: _load_isolated(
++            _bundle_member(bundle_dir, manifest['files'][role]['path']),
++            bundle_id=manifest['bundle_id'],
++            role=role,
++        )
++        for role in _ROLES
++    }
++
++    parser_class = _resolve_class(
++        modules['parser'],
++        entries['parser_class'],
++        Parser,
++        role='parser',
++    )
++    semantics_class = _resolve_class(
++        modules['model'],
++        entries['model_semantics_class'],
++        ModelBuilderSemantics,
++        role='model semantics',
++    )
++
++    return LoadedBundle(
++        path=bundle_dir,
++        bundle_id=manifest['bundle_id'],
++        grammar_name=manifest['grammar_name'],
++        manifest=manifest,
++        parser_module=modules['parser'],
++        model_module=modules['model'],
++        parser=parser_class,
++        semantics=semantics_class,
++    )
++
++
++def _sha256(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++
++
++def _stamp(source: str, bundle_id: str, grammar_name: str) -> str:
++    marker = (
++        f'\n\n{_MARKER_BEGIN}\n'
++        f'{_MARKER_PREFIX}id: {bundle_id}\n'
++        f'{_MARKER_PREFIX}grammar: {grammar_name}\n'
++        f'{_MARKER_END}\n'
++    )
++    return source.rstrip() + marker
++
++
++def _read_marker(source: str, field: str) -> str | None:
++    prefix = f'{_MARKER_PREFIX}{field}:'
++    for raw_line in source.splitlines():
++        line = raw_line.strip()
++        if line.startswith(prefix):
++            return line[len(prefix) :].strip()
++    return None
++
++
++def _bundle_member(bundle_dir: Path, rel: str) -> Path:
++    member_path = Path(rel)
++    if member_path.is_absolute() or '..' in member_path.parts:
++        raise BundleError(f'unsafe path in bundle manifest: {rel}')
++    root = bundle_dir.resolve()
++    member = (bundle_dir / member_path).resolve()
++    if not member.is_relative_to(root):
++        raise BundleError(f'path escapes the bundle directory: {rel}')
++    return member
++
++
++def _replace_directory(src: Path, dst: Path) -> None:
++    """Move directory ``src`` into the ``dst`` location, preserving ``dst``."""
++    if not dst.exists():
++        src.replace(dst)
++        return
++
++    backup = dst.with_name(dst.name + '.old')
++    if backup.exists():
++        shutil.rmtree(backup)
++    dst.replace(backup)
++    try:
++        src.replace(dst)
++    except OSError:
++        # Put the previous bundle back before reporting the failure.
++        backup.replace(dst)
++        raise
++    shutil.rmtree(backup, ignore_errors=True)
++
++
++def _discard_bytecode_cache(*_args: Any, **_kwargs: Any) -> None:
++    """Replacement for ``SourceFileLoader.set_data`` that writes nothing."""
++
++
++def _load_isolated(path: Path, *, bundle_id: str, role: str) -> types.ModuleType:
++    modname = f'_tatsu_bundle_{bundle_id[:12]}_{role}_{uuid.uuid4().hex[:12]}'
++    spec = importlib.util.spec_from_file_location(modname, path)
++    if spec is None or spec.loader is None:
++        raise BundleError(f'cannot create an import specification for {path}')
++    # Bundles are published artifacts: do not litter them with __pycache__.
++    spec.loader.set_data = _discard_bytecode_cache  # type: ignore[attr-defined]
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[modname] = module
++    try:
++        spec.loader.exec_module(module)
++    except BaseException:
++        sys.modules.pop(modname, None)
++        raise
++    return module
++
++
++def _resolve_class(
++    module: types.ModuleType,
++    class_name: str,
++    base: type[_T],
++    *,
++    role: str,
++) -> type[_T]:
++    found = getattr(module, class_name, None)
++    if isinstance(found, type) and issubclass(found, base):
++        return found
++
++    for candidate in vars(module).values():
++        if (
++            isinstance(candidate, type)
++            and issubclass(candidate, base)
++            and candidate is not base
++        ):
++            return candidate
++
++    raise BundleError(
++        f'the {role} module does not define {class_name} '
++        f'(a subclass of {base.__name__})',
++    )
+diff --git a/tatsu/exceptions.py b/tatsu/exceptions.py
+index 6d8c8f3b..3c43fac7 100644
+--- a/tatsu/exceptions.py
++++ b/tatsu/exceptions.py
+@@ -51,6 +51,12 @@ class CodegenError(ParseError):
+     pass
+ 
+ 
++class BundleError(TatSuException):
++    """Raised when a parser/model bundle is invalid, mixed, or corrupted."""
++
++    pass
++
++
+ class FailedSemantics(ParseException):
+     pass
+ 
+diff --git a/tatsu/util/version.py b/tatsu/util/version.py
+index 6762c95a..db80a737 100644
+--- a/tatsu/util/version.py
++++ b/tatsu/util/version.py
+@@ -117,7 +117,11 @@ class Version:
+                 return None, None  # type: ignore
+ 
+             alpha = ''.join(takewhile(str.isalpha, s))
++            # PEP 440 allows a separator between the letter and the number
++            # (b.1, b-1 and b_1 all normalize to b1).
+             digits = s[len(alpha) :]
++            if alpha:
++                digits = digits.lstrip('-_.')
+             if digits.isdigit():
+                 digits = int(digits)  # type: ignore
+             return alpha, digits
+diff --git a/tests/bundle_test.py b/tests/bundle_test.py
+new file mode 100644
+index 00000000..1b3935d2
+--- /dev/null
++++ b/tests/bundle_test.py
+@@ -0,0 +1,346 @@
++# Copyright (c) 2017-2026 Juancarlo Añez (apalala@gmail.com)
++# SPDX-License-Identifier: BSD-4-Clause
++from __future__ import annotations
++
++import hashlib
++import json
++import shutil
++
++import pytest
++
++import tatsu
++from tatsu.exceptions import BundleError, FailedParse, ParseException
++from tatsu.objectmodel import Node
++from tatsu.objectmodel.builder import ModelBuilderSemantics
++from tatsu.parsing import Parser
++from tatsu.util import hasha
++
++
++GRAMMAR = r"""
++    @@grammar :: Calc
++
++    start = expression $ ;
++
++    expression
++        =
++        | addition
++        | number
++        ;
++
++    addition::Add
++        =
++        left:number '+' right:number
++        ;
++
++    number::int
++        =
++        /\d+/
++        ;
++"""
++
++# A different grammar that deliberately keeps the same grammar name.
++GRAMMAR_OTHER = r"""
++    @@grammar :: Calc
++
++    start = greeting $ ;
++
++    greeting::Greet
++        =
++        'hello' who:word
++        ;
++
++    word
++        =
++        /[a-z]+/
++        ;
++"""
++
++BROKEN_GRAMMAR = """
++    @@grammar :: Broken
++
++    start = rule_that_does_not_exist $ ;
++"""
++
++
++def _sha256_file(path) -> str:
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def _rehash_manifest(bundle_dir) -> None:
++    """Rewrite manifest checksums to match the files currently on disk."""
++    manifest_path = bundle_dir / 'manifest.json'
++    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
++    for spec in manifest['files'].values():
++        spec['sha256'] = _sha256_file(bundle_dir / spec['path'])
++    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
++
++
++def test_export_creates_identity_and_checksum_manifest(tmp_path):
++    outdir = tmp_path / 'calc'
++    info = tatsu.export_bundle(GRAMMAR, outdir)
++
++    assert info.path == outdir
++    assert (outdir / 'parser.py').is_file()
++    assert (outdir / 'model.py').is_file()
++    assert (outdir / 'manifest.json').is_file()
++
++    manifest = json.loads((outdir / 'manifest.json').read_text())
++    assert manifest['format'] == 'tatsu-parser-bundle'
++    assert manifest['bundle_version'] == 1
++    assert manifest['bundle_id'] == info.bundle_id
++    assert manifest['grammar_name'] == 'Calc'
++    assert manifest['grammar_sha256'] == hasha(GRAMMAR)
++    assert manifest['tatsu_version'] == tatsu.version
++    assert manifest['entries'] == {
++        'parser_class': 'CalcParser',
++        'model_semantics_class': 'CalcModelBuilderSemantics',
++    }
++
++    for role, filename in (('parser', 'parser.py'), ('model', 'model.py')):
++        spec = manifest['files'][role]
++        assert spec['path'] == filename
++        assert spec['sha256'] == _sha256_file(outdir / filename)
++
++    parser_src = (outdir / 'parser.py').read_text()
++    model_src = (outdir / 'model.py').read_text()
++    assert f'# tatsu-bundle-id: {info.bundle_id}' in parser_src
++    assert f'# tatsu-bundle-id: {info.bundle_id}' in model_src
++    assert 'class CalcParser(Parser):' in parser_src
++    assert 'class CalcModelBuilderSemantics' in model_src
++
++
++def test_load_returns_matching_parser_and_model_types(tmp_path):
++    bundle = tatsu.load_bundle(tatsu.export_bundle(GRAMMAR, tmp_path / 'calc').path)
++
++    assert bundle.grammar_name == 'Calc'
++    assert issubclass(bundle.parser, Parser)
++    assert bundle.parser.__name__ == 'CalcParser'
++    assert issubclass(bundle.semantics, ModelBuilderSemantics)
++    assert bundle.semantics.__name__ == 'CalcModelBuilderSemantics'
++    assert issubclass(bundle.model_module.Add, Node)
++
++    result = bundle.parse('1+2')
++    assert isinstance(result, bundle.model_module.Add)
++    assert result.left == 1
++    assert result.right == 2
++
++    # The same pairing must work assembling parser and semantics by hand.
++    parser = bundle.parser(semantics=bundle.semantics())
++    result = parser.parse('7+8', parseinfo=False)
++    assert isinstance(result, bundle.model_module.Add)
++    assert (result.left, result.right) == (7, 8)
++
++
++def test_bundle_is_relocatable(tmp_path):
++    outdir = tmp_path / 'calc'
++    tatsu.export_bundle(GRAMMAR, outdir)
++
++    moved = tmp_path / 'elsewhere' / 'calc'
++    shutil.move(str(outdir), str(moved))
++
++    bundle = tatsu.load_bundle(moved)
++    result = bundle.parse('3+4')
++    assert isinstance(result, bundle.model_module.Add)
++    assert (result.left, result.right) == (3, 4)
++
++
++def test_corrupted_file_is_rejected(tmp_path):
++    outdir = tmp_path / 'calc'
++    tatsu.export_bundle(GRAMMAR, outdir)
++
++    (outdir / 'parser.py').write_text(
++        (outdir / 'parser.py').read_text() + '\n# tampered\n',
++    )
++    with pytest.raises(BundleError, match='checksum mismatch'):
++        tatsu.load_bundle(outdir)
++
++
++def test_missing_file_is_rejected(tmp_path):
++    outdir = tmp_path / 'calc'
++    tatsu.export_bundle(GRAMMAR, outdir)
++
++    (outdir / 'model.py').unlink()
++    with pytest.raises(BundleError, match='missing bundle file'):
++        tatsu.load_bundle(outdir)
++
++
++def test_broken_manifest_is_rejected(tmp_path):
++    outdir = tmp_path / 'calc'
++    tatsu.export_bundle(GRAMMAR, outdir)
++
++    (outdir / 'manifest.json').write_text('{not json', encoding='utf-8')
++    with pytest.raises(BundleError, match='unreadable bundle manifest'):
++        tatsu.load_bundle(outdir)
++
++
++def test_unsupported_bundle_version_is_rejected(tmp_path):
++    outdir = tmp_path / 'calc'
++    tatsu.export_bundle(GRAMMAR, outdir)
++
++    manifest_path = outdir / 'manifest.json'
++    manifest = json.loads(manifest_path.read_text())
++    manifest['bundle_version'] = 99
++    manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
++
++    with pytest.raises(BundleError, match='unsupported bundle version'):
++        tatsu.load_bundle(outdir)
++
++
++def test_manifest_path_escaping_is_rejected(tmp_path):
++    outdir = tmp_path / 'calc'
++    tatsu.export_bundle(GRAMMAR, outdir)
++
++    manifest_path = outdir / 'manifest.json'
++    manifest = json.loads(manifest_path.read_text())
++    manifest['files']['parser']['path'] = '../../escape.py'
++    manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
++
++    with pytest.raises(BundleError, match='unsafe path in bundle manifest'):
++        tatsu.load_bundle(outdir)
++
++
++def test_files_from_different_generations_are_rejected(tmp_path):
++    first = tmp_path / 'first'
++    other = tmp_path / 'other'
++    tatsu.export_bundle(GRAMMAR, first)
++    tatsu.export_bundle(GRAMMAR_OTHER, other)
++
++    # Swap the model in, keeping the original (now stale) manifest.
++    shutil.copyfile(other / 'model.py', first / 'model.py')
++    with pytest.raises(BundleError, match='checksum mismatch'):
++        tatsu.load_bundle(first)
++
++
++def test_mixed_markers_rejected_even_if_checksums_repaired(tmp_path):
++    first = tmp_path / 'first'
++    other = tmp_path / 'other'
++    tatsu.export_bundle(GRAMMAR, first)
++    tatsu.export_bundle(GRAMMAR_OTHER, other)
++
++    # An attacker/reshuffling user updates the checksums after swapping
++    # files in; the generation-identity markers must still expose the mix.
++    shutil.copyfile(other / 'model.py', first / 'model.py')
++    _rehash_manifest(first)
++    with pytest.raises(BundleError, match='another generation'):
++        tatsu.load_bundle(first)
++
++
++def test_unbundled_plain_generation_is_rejected(tmp_path):
++    outdir = tmp_path / 'calc'
++    info = tatsu.export_bundle(GRAMMAR, outdir)
++
++    plain_parser = tatsu.to_python_sourcecode(GRAMMAR, name='Calc')
++    (outdir / 'parser.py').write_text(plain_parser, encoding='utf-8')
++
++    manifest_path = outdir / 'manifest.json'
++    manifest = json.loads(manifest_path.read_text())
++    manifest['files']['parser']['sha256'] = _sha256_file(outdir / 'parser.py')
++    manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
++
++    with pytest.raises(BundleError, match='identity marker'):
++        tatsu.load_bundle(outdir)
++
++    assert info.bundle_id  # the export itself remains valid information
++
++
++def test_failed_export_preserves_previous_bundle(tmp_path):
++    outdir = tmp_path / 'calc'
++    first = tatsu.export_bundle(GRAMMAR, outdir)
++    original_parser = (outdir / 'parser.py').read_text()
++
++    with pytest.raises(ParseException):
++        tatsu.export_bundle(BROKEN_GRAMMAR, outdir)
++
++    assert not list(tmp_path.glob('.calc.*.tmp'))
++    assert not (tmp_path / 'calc.old').exists()
++
++    bundle = tatsu.load_bundle(outdir)
++    assert bundle.bundle_id == first.bundle_id
++    assert (outdir / 'parser.py').read_text() == original_parser
++    result = bundle.parse('2+5')
++    assert isinstance(result, bundle.model_module.Add)
++    assert (result.left, result.right) == (2, 5)
++
++
++def test_successful_reexport_replaces_bundle_without_leftovers(tmp_path):
++    outdir = tmp_path / 'calc'
++    first = tatsu.export_bundle(GRAMMAR, outdir)
++    second = tatsu.export_bundle(GRAMMAR_OTHER, outdir)
++
++    assert first.bundle_id != second.bundle_id
++    assert not list(tmp_path.glob('.calc.*.tmp'))
++    assert not (tmp_path / 'calc.old').exists()
++
++    bundle = tatsu.load_bundle(outdir)
++    assert bundle.bundle_id == second.bundle_id
++    result = bundle.parse('hello world')
++    assert isinstance(result, bundle.model_module.Greet)
++    assert result.who == 'world'
++
++
++def test_same_named_grammars_load_without_cross_state(tmp_path):
++    dir_a = tmp_path / 'a' / 'calc'
++    dir_b = tmp_path / 'b' / 'calc'
++    tatsu.export_bundle(GRAMMAR, dir_a)
++    tatsu.export_bundle(GRAMMAR_OTHER, dir_b)
++
++    bundle_a = tatsu.load_bundle(dir_a)
++    bundle_b = tatsu.load_bundle(dir_b)
++
++    assert bundle_a.parser.__name__ == bundle_b.parser.__name__ == 'CalcParser'
++    assert bundle_a.parser is not bundle_b.parser
++    assert bundle_a.parser_module.__name__ != bundle_b.parser_module.__name__
++    assert bundle_a.model_module is not bundle_b.model_module
++    assert bundle_a.model_module.ModelBase is not bundle_b.model_module.ModelBase
++    assert bundle_a.semantics is not bundle_b.semantics
++
++    result_a = bundle_a.parse('1+2')
++    result_b = bundle_b.parse('hello mars')
++    assert isinstance(result_a, bundle_a.model_module.Add)
++    assert isinstance(result_b, bundle_b.model_module.Greet)
++
++    # Grammar A has no "greeting" rule; the two parsers must not share rules.
++    with pytest.raises(FailedParse):
++        bundle_a.parser().parse('hello venus')
++    with pytest.raises(FailedParse):
++        bundle_b.parser().parse('1+2')
++
++
++def test_loading_does_not_write_bytecode_into_bundle(tmp_path):
++    outdir = tmp_path / 'calc'
++    tatsu.export_bundle(GRAMMAR, outdir)
++
++    tatsu.load_bundle(outdir)
++    tatsu.load_bundle(outdir)
++
++    assert list(outdir.rglob('__pycache__')) == []
++
++
++def test_loading_one_bundle_twice_yields_distinct_classes(tmp_path):
++    outdir = tmp_path / 'calc'
++    tatsu.export_bundle(GRAMMAR, outdir)
++
++    first = tatsu.load_bundle(outdir)
++    second = tatsu.load_bundle(outdir)
++
++    assert first.parser is not second.parser
++    assert first.parser_module is not second.parser_module
++    assert first.model_module.Add is not second.model_module.Add
++    assert first.semantics is not second.semantics
++
++    assert isinstance(first.parse('1+2'), first.model_module.Add)
++    assert isinstance(second.parse('3+4'), second.model_module.Add)
++
++
++def test_legacy_generation_interfaces_remain_available():
++    parser_source = tatsu.to_python_sourcecode(GRAMMAR, name='Calc')
++    model_source = tatsu.to_python_model(GRAMMAR, name='Calc')
++
++    assert 'class CalcParser(Parser):' in parser_source
++    assert 'class CalcModelBuilderSemantics' in model_source
++
++    model = tatsu.compile(GRAMMAR, name='Calc')
++    assert model.parse('1+2', parseinfo=False) == {
++        'left': '1',
++        'right': '2',
++    }
+diff --git a/tests/version_test.py b/tests/version_test.py
+new file mode 100644
+index 00000000..c6a8d466
+--- /dev/null
++++ b/tests/version_test.py
+@@ -0,0 +1,29 @@
++# Copyright (c) 2017-2026 Juancarlo Añez (apalala@gmail.com)
++# SPDX-License-Identifier: BSD-4-Clause
++from __future__ import annotations
++
++import pytest
++
++from tatsu.util import Version
++
++
++@pytest.mark.parametrize(
++    'text',
++    ['v5.24.1-b.1', '5.24.1b.1', '5.24.1-b-1', '5.24.1_b_1', '5.24.1b1'],
++)
++def test_prerelease_separators_between_letter_and_number(text):
++    # PEP 440 allows a separator between the pre-release letter and its number
++    version = Version.parse(text)
++    assert version.level == 'b'
++    assert version.serial == 1
++
++
++def test_release_version_still_parses():
++    version = Version.parse('v5.24.0')
++    assert (version.major, version.minor, version.micro) == (5, 24, 0)
++    assert version.level is None
++
++
++def test_invalid_version_string_is_rejected():
++    with pytest.raises(ValueError, match='Invalid version string'):
++        Version.parse('not-a-version')

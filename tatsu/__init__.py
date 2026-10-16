@@ -8,14 +8,20 @@ from . import config as parserconfig, input as tokenizing
 from ._grammar import grammar, grammar_path
 from ._version import __toolname__, __version__, version, version_info
 from .api import (
+    BundleError,
+    BundleInfo,
+    LoadedBundle,
     compile,
     compile_to_parser,
+    export_bundle,
     gencode,
     genmodel,
+    load_bundle,
     parse,
     to_grammar_json,
     to_python_model,
     to_python_sourcecode,
+    verify_bundle,
 )  # pylint: disable=W0622
 from .contexts import ast as ast
 from .contexts.decorator import isname, leftrec, name, nomemo, rule, tatsumasu
@@ -61,6 +67,12 @@ __all__ = [
     'to_python_sourcecode',
     'version',
     'version_info',
+    'BundleError',
+    'BundleInfo',
+    'LoadedBundle',
+    'export_bundle',
+    'load_bundle',
+    'verify_bundle',
     'isname',
     'NodeDataclassParams',
     'TatSuDataclassParams',

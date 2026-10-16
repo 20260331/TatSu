@@ -1,0 +1,46 @@
+审核对象：repo/TatSu-swe/worktrees/q2-parser-model-release-validation
+分支：swe/q2-parser-model-release-validation
+基线：8f9d741a4652c4b7bb34033cfefa6ce562b856d8
+有效轮数：144
+harness：Trae
+Type：有效轮数 > 100
+
+验证命令：
+1. .venv/bin/python -m pytest tests/bundle_test.py tests/version_test.py
+   结果：24 passed in 0.66s
+2. .venv/bin/python -m pytest -n auto --ignore-glob='tests/z*' tests
+   结果：498 passed, 7 skipped in 15.08s
+3. .venv/bin/python -m pytest tests/z_bootstrap_test.py
+   结果：13 passed, 1 skipped in 70.44s
+4. .venv/bin/ruff check --preview 与 ruff format --check（7 个改动文件）
+   结果：All checks passed! / 7 files already formatted
+5. .venv/bin/ty check tatsu tests
+   结果：All checks passed!
+6. .venv/bin/mypy tatsu/bundle.py tatsu/util/version.py
+   结果：Success: no issues found in 2 source files
+7. examples/calc：PYTHONPATH=../.. .venv/bin/python calc.py
+   结果：正常输出 POSTFIX 与结果 -47
+8. 运行时复现：.venv/bin/python evidence/demo_bundle.py，覆盖旧接口、成套导出、加载配对、搬迁、损坏/缺文件/混用拒绝、失败保留旧目录、同名隔离
+
+产物结果：
+1 通过
+2 通过
+3 通过
+4 通过
+5 通过
+6 通过
+7 通过
+8 通过
+9 通过
+
+完成度：完成。新增 tatsu/bundle.py，提供 export_bundle、load_bundle、verify_bundle 三个可选入口（顶层 tatsu.* 与 tatsu.api.* 均可访问），并新增 BundleError 与 BundleInfo/LoadedBundle。导出时在同级临时目录生成 parser.py、model.py、manifest.json 并自校验通过后再替换目标目录，清单记录 bundle_id、grammar 名与 grammar 源 SHA-256、TatSu 版本、生成时间、入口类名以及每份文件的相对路径与 SHA-256，两个生成文件尾部另加盖同一 bundle_id 身份 marker。load_bundle 先 verify_bundle 校验再用唯一模块名隔离加载，返回配对的 parser 与模型/semantics 类型；bundle.parse() 直接接线解析，结果由该 bundle 自带模型类构造。损坏（摘要不符）、缺文件、未知版本、非法路径、跨次混用（即使重算摘要，靠 marker 仍能识别）、无 marker 的普通生成文件均在执行前被拒绝。生成失败时旧目录字节不变、无 .tmp/.old 残留；同名 grammar 交错加载与重复加载均得到独立的 parser/模型/semantics 对象。旧接口 to_python_sourcecode/to_python_model/compile 与 CLI 行为不变，新增 20 条测试通过，fast 套件 498 passed/7 skipped、boot 13 passed/1 skipped，静态检查与 examples/calc 全部通过，未发现回归。
+
+附带改动说明：分支基线 8f9d741a 的安装版本号为 5.24.1-b.1，util/version.py 的预发布号解析无法处理该 PEP 440 写法，导致 import tatsu 失败、整个测试套件无法收集。模型在实现 bundle 功能前先修复了该阻断问题（接受 b.1 / b-1 / b_1 并规范化为 serial=1），并附版本解析回归测试。该修复不属于题目 Prompt 的功能要求，但不修复则功能无法运行与验证，判定为必要的环境/基线修复，不作为缺陷或额外扣分项。
+
+验收标准说明：Verify Rubric 严格按原始 Prompt 界定，只覆盖可选成套导出/加载入口、成对产物与生成身份及内容校验信息、目录可搬迁、加载前拒绝损坏与混用、返回可配套解析的 parser 与模型类型、生成失败保留旧目录、同名 grammar 不串类或状态，以及旧生成接口不回归。未把任务卡“验收”里超出 Prompt 的项（相同 grammar/选项/版本得到相同身份的确定性、符号链接逃逸拒绝、执行计数为零、恶意重写整套声明等）纳入验收项，也不据此扣分。其中“即使重算摘要仍拒绝混用”是对 Prompt 中“生成身份 + 拒绝混用”的偏严解释，已由产物内身份 marker 实现并测试覆盖。
+
+补充材料：
+- 分支 swe/q2-parser-model-release-validation，补丁见 evidence/model.patch（tatsu/bundle.py、tatsu/__init__.py、tatsu/api/__init__.py、tatsu/exceptions.py、tatsu/util/version.py、tests/bundle_test.py、tests/version_test.py）
+- 行为截图 evidence/screenshots/q2-bundle-demo.png（真实运行 demo_bundle.py 的输出）
+- 审核报告截图 evidence/screenshots/q2-audit-report.png
+- 复现脚本 evidence/demo_bundle.py，运行日志 evidence/logs/q2-bundle-demo.txt、evidence/logs/q2-checks.txt

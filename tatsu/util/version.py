@@ -117,7 +117,11 @@ class Version:
                 return None, None  # type: ignore
 
             alpha = ''.join(takewhile(str.isalpha, s))
+            # PEP 440 allows a separator between the letter and the number
+            # (b.1, b-1 and b_1 all normalize to b1).
             digits = s[len(alpha) :]
+            if alpha:
+                digits = digits.lstrip('-_.')
             if digits.isdigit():
                 digits = int(digits)  # type: ignore
             return alpha, digits

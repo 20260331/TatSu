@@ -1,0 +1,48 @@
+TatSu 5.24.1-b.1   python 3.14.7
+
+[1] Legacy generation interfaces still work
+   to_python_sourcecode  -> True
+   to_python_model       -> True
+   compile(...).parse('1+2') -> {'right': '2', 'left': '1'}
+
+[2] Paired export publishes identity and content checksums
+   export_bundle -> bundle_id=93f5bd629735... grammar=Calc
+   dir contents  -> ['manifest.json', 'model.py', 'parser.py']
+   manifest.format          = tatsu-parser-bundle
+   manifest.bundle_version  = 1
+   manifest.bundle_id       = 93f5bd6297354b0f9ef96...
+   manifest.grammar_name    = Calc
+   manifest.grammar_sha256  = d6d3e48574c8e23236a3c...
+   manifest.tatsu_version   = 5.24.1-b.1
+   manifest.generated_at    = 2026-10-13T08:46:24+0...
+   manifest.entries = {'model_semantics_class': 'CalcModelBuilderSemantics', 'parser_class': 'CalcParser'}
+   manifest.files   = ['model', 'parser'] each with sha256 + relative path
+   identity marker in parser.py and model.py -> True
+
+[3] load_bundle returns parser and model types that parse together
+   parser     = _tatsu_bundle_93f5bd629735_parser_5979aacc0329.CalcParser
+   semantics  = CalcModelBuilderSemantics
+   parsed '1+2' -> Add(left=1, right=2) of bundled model -> True
+   hand-wired parser.parse('7+8') -> <_tatsu_bundle_93f5bd629735_model_dac0b7db79ae.Add object at 0x7084c5023250>
+
+[4] Bundle is relocatable
+   moved to elsewhere/calc -> load OK, parse -> Add(left=3, right=4)
+
+[5] Corrupted file is rejected before executing any code
+   BundleError: checksum mismatch for parser.py: the file is corrupted or was replaced by one from a different generation
+
+[6] Missing file is rejected
+   BundleError: missing bundle file: model.py
+
+[7] Files from two generations are rejected, even after rehashing
+   BundleError: model.py belongs to another generation (b32de08a != 99f62930); refusing to mix bundles
+
+[8] Failed generation preserves the previous bundle
+   second export failed: GrammarError
+   previous bundle intact -> True; temp/backup leftovers -> []
+
+[9] Two same-named grammars do not cross classes or state
+   both report grammar_name=Calc; parser classes distinct -> True
+   model modules distinct -> True; model base classes distinct -> True; semantics distinct -> True
+   '1+2' -> Add (bundle A); 'hello mars' -> Greet (bundle B)
+   parser A rejects grammar B input -> FailedParse

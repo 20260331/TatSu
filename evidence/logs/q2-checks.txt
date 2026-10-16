@@ -1,0 +1,25 @@
+### targeted: pytest tests/bundle_test.py tests/version_test.py
+........................                                                 [100%]
+24 passed in 0.66s
+
+### full fast suite: pytest -n auto --ignore-glob='tests/z*' tests
+........................................................................ [ 85%]
+.........................ss..................................s.......... [ 99%]
+.                                                                        [100%]
+498 passed, 7 skipped in 15.08s
+
+### boot suite: pytest tests/z_bootstrap_test.py
+.............s                                                           [100%]
+13 passed, 1 skipped in 70.44s (0:01:10)
+
+### ruff check --preview (changed files)
+All checks passed!
+
+### ruff format --check (changed files)
+7 files already formatted
+
+### ty check (tatsu + tests)
+All checks passed!
+
+### mypy (changed source files)
+Success: no issues found in 2 source files
